@@ -4,9 +4,11 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"os"
 	"runtime"
 	"runtime/pprof"
+	"sort"
 	"sync"
 	"time"
 )
@@ -14,6 +16,7 @@ import (
 const FILE_PATH = "/1brc/measurements.txt"
 const MAX_BUFFER_SIZE = 2 * 1024 * 1024
 const CHANNEL_CAPACITY = 100
+const NUMBER_OF_BUCKETS = 100000
 
 type Station struct {
 	Name  []byte
@@ -21,6 +24,44 @@ type Station struct {
 	Min   int
 	Sum   int
 	Count int
+}
+
+type Pair struct {
+	key     uint64
+	station *Station
+}
+
+type StationMap struct {
+	buckets [][]Pair
+	keys    []uint64
+}
+
+func (m *StationMap) Get(key uint64) (*Station, bool) {
+	bucketInd := key % NUMBER_OF_BUCKETS
+	bucket := m.buckets[bucketInd]
+	if bucket == nil {
+		return nil, false
+	}
+
+	for _, pair := range bucket {
+		if pair.key == key {
+			return pair.station, true
+		}
+	}
+	return nil, false
+}
+
+func (m *StationMap) Set(key uint64, station *Station) {
+	bucketInd := key % NUMBER_OF_BUCKETS
+	m.keys = append(m.keys, key)
+	m.buckets[bucketInd] = append(m.buckets[bucketInd], Pair{key: key, station: station})
+}
+
+func NewStationMap() *StationMap {
+	return &StationMap{
+		buckets: make([][]Pair, NUMBER_OF_BUCKETS),
+		keys:    make([]uint64, 0, NUMBER_OF_BUCKETS),
+	}
 }
 
 // there is small buf with the reading try 1 2 4 megabytes buffer differnt number of lines
@@ -77,14 +118,14 @@ func parseLine(chunk []byte) ([]byte, int, int) {
 		ind++
 	}
 
-	temp := int(chunk[ind] - '0')
+	temp := int(chunk[ind])
 	ind++
 	if chunk[ind] == '.' {
-		temp = temp*10 + int(chunk[ind+1]-'0')
+		temp = temp*10 + int(chunk[ind+1]) - int('0')*11
 		ind += 3
 	} else {
-		t := (chunk[ind]-'0')*10 + chunk[ind+2] - '0'
-		temp = 100*temp + int(t)
+		t := int(chunk[ind])*10 + int(chunk[ind+2]) - int('0')*111
+		temp = 100*temp + t
 		ind += 4
 	}
 
@@ -94,9 +135,9 @@ func parseLine(chunk []byte) ([]byte, int, int) {
 	return name, temp, ind
 }
 
-func updateStationsMap(stations map[uint64]*Station, name []byte, temp int) {
+func updateStationsMap(stations *StationMap, name []byte, temp int) {
 	id := hash(name)
-	station, ok := stations[id]
+	station, ok := stations.Get(id)
 	if ok {
 		station.Max = max(station.Max, temp)
 		station.Min = min(station.Min, temp)
@@ -104,18 +145,18 @@ func updateStationsMap(stations map[uint64]*Station, name []byte, temp int) {
 		station.Count++
 		return
 	}
-	stations[id] = &Station{
+	stations.Set(id, &Station{
 		Name:  name,
 		Max:   temp,
 		Min:   temp,
 		Sum:   temp,
 		Count: 1,
-	}
+	})
 }
 
-func spwanWorker(chunkChannel <-chan []byte, mapChannel chan map[uint64]*Station, wg *sync.WaitGroup) {
+func spwanWorker(chunkChannel <-chan []byte, mapChannel chan *StationMap, wg *sync.WaitGroup) {
 	defer wg.Done()
-	stations := make(map[uint64]*Station)
+	stations := NewStationMap()
 	for chunk := range chunkChannel {
 		chunkSize := len(chunk)
 		ind := 0
@@ -142,7 +183,7 @@ func main() {
 
 	var wg sync.WaitGroup
 	numberOfWorkers := runtime.NumCPU() - 1
-	mapChannel := make(chan map[uint64]*Station, numberOfWorkers)
+	mapChannel := make(chan *StationMap, numberOfWorkers)
 	for ind := 0; ind < numberOfWorkers; ind++ {
 		go spwanWorker(chunkChannel, mapChannel, &wg)
 		wg.Add(1)
@@ -150,27 +191,36 @@ func main() {
 	wg.Wait()
 
 	close(mapChannel)
-	result := make(map[uint64]*Station)
+	result := NewStationMap()
 	for stations := range mapChannel {
-		for id, station := range stations {
-			record, ok := result[id]
+		for _, id := range stations.keys {
+			station, _ := stations.Get(id)
+			record, ok := result.Get(id)
 			if ok {
 				record.Max = max(record.Max, station.Max)
 				record.Min = min(record.Min, station.Min)
 				record.Sum += station.Sum
 				record.Count += station.Count
 			} else {
-				result[id] = station
+				result.Set(id, station)
 			}
 		}
 	}
 
-	for _, record := range result {
-		fmt.Printf("%s -> Min = %.1f, Mean = %.1f, Max = %.1f\n", record.Name,
+	sort.Slice(result.keys, func(i, j int) bool {
+		first, _ := result.Get(result.keys[i])
+		second, _ := result.Get(result.keys[j])
+		return string(first.Name) < string(second.Name)
+	})
+
+	for _, id := range result.keys {
+		record, _ := result.Get(id)
+		fmt.Printf("%s=%.1f/%.1f/%.1f\n", record.Name,
 			float64(record.Min)/10,
-			float64(record.Sum)/float64(record.Count)/10,
+			math.Round(float64(record.Sum)/float64(record.Count))/10,
 			float64(record.Max)/10,
 		)
 	}
+
 	log.Println(time.Since(st))
 }
